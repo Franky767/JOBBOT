@@ -1,0 +1,62 @@
+# ============================================
+# MY PROFILE - Copy to AIHawk/my_profile.yaml
+# ============================================
+
+personal_info:
+  name: "Your Full Name"
+  email: "your.email@example.com"
+  phone: "123-456-7890"
+  location: "Your City, State, ZIP"
+  linkedin: "https://linkedin.com/in/your-profile"
+  portfolio: "https://your-portfolio.com"
+  ethnicity: "Hispanic/Latino"
+  gender: "Male"
+
+professional_skills:
+  job_titles:
+    - "marketing manager"
+    - "product marketing manager"
+    - "growth marketing manager"
+  tools_technologies:
+    - "Python"
+    - "SQL"
+    - "Tableau"
+    - "HubSpot"
+    - "Salesforce"
+  skills_concepts:
+    - "Digital Marketing"
+    - "Product Strategy"
+    - "Data Analytics"
+    - "SEO/SEM"
+    - "Email Marketing"
+  experience:
+    total_years: 13
+
+search_config:
+  minimum_salary: 100000
+  work_modes:
+    - "Remote"
+
+key_achievements:
+  - "[HIGH] Built 3 AI-powered automation systems eliminating thousands of manual hours"
+  - "Led $250K fundraising campaign, exceeded goal by 100%"
+  - "Drove 50% revenue growth in 6 months through omnichannel strategy"
+
+certifications:
+  - "Google Digital Marketing & E-Commerce"
+  - "Google Data Analytics"
+  - "IBM Tech Product Management"
+
+education:
+  - degree: "Bachelor's in Marketing"
+    institution: "Your University"
+    year: "2015"
+
+plataformas:
+  linkedin:
+    easy_apply_only: true
+  greenhouse:
+    target_companies:
+      - "stripe"
+      - "airbnb"
+      - "notion"

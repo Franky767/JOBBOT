@@ -1,0 +1,38 @@
+# ============================================
+# PLAIN TEXT RESUME - Copy to AIHawk/data_folder/plain_text_resume.yaml
+# ============================================
+
+resume_text: |
+  Your Name
+  your.email@example.com | 123-456-7890 | Your City, State
+
+  PROFESSIONAL SUMMARY
+  Results-driven professional with 10+ years of experience...
+
+  PROFESSIONAL EXPERIENCE
+
+  Company Name | Location
+  Job Title | 2020 - Present
+  • Key achievement 1
+  • Key achievement 2
+  • Key achievement 3
+
+experience_details:
+  - company: "Company Name"
+    location: "Remote"
+    position: "Your Position"
+    employment_period: "2020 - Present"
+    achievements:
+      - "[HIGH] Key achievement with measurable result"
+      - "Another important achievement"
+      - "Third achievement"
+
+projects:
+  - name: "Project Name"
+    company: "Company"
+    period: "2023"
+    description: |
+      Situation: What was the context
+      Task: What needed to be done
+      Action: What you did
+      Result: What happened (with numbers)

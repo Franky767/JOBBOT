@@ -1,0 +1,45 @@
+# ============================================
+# CRITICAL - REMOVE THESE FROM GIT
+# ============================================
+
+# Chrome browser profiles (contains passwords, cookies, history)
+chrome-debug/
+chrome_profile/
+chrome_*.profile/
+
+# Your personal documents (resumes, cover letters)
+career_building/
+*.pdf
+*.docx
+
+# Results and manual runs
+manual_results/
+rejection_emails.json
+commands.txt
+daily_report.py
+delete_rejections.py
+manual_processor.py
+reset_limits.py
+run_daily.sh
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# JSON files with personal data
+*_emails.json
+rejection_emails.json
+
+# Already covered but double-check
+AIHawk/
+platforms/
+bot_profile*/
+results/
+shared/
+venv*/
+__pycache__/
+*.pyc
+.env
+*.env
+.DS_Store

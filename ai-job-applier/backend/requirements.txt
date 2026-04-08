@@ -1,0 +1,12 @@
+fastapi==0.115.*
+uvicorn[standard]==0.30.*
+playwright==1.48.*
+openai>=1.40.0
+anthropic>=0.18.0
+python-multipart==0.0.9
+pydantic==2.*
+python-dotenv==1.0.*
+websockets==12.*
+aiosqlite==0.19.*
+pdfminer.six==20231228
+python-docx==1.1.*
