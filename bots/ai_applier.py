@@ -189,28 +189,44 @@ class AIApplier:
                 print(f"   ❌ Outlook auth failed: {err}")
                 return False
 
-    def get_greenhouse_code(self, max_wait_seconds: int = 180) -> Optional[str]:
-        """Poll Outlook for Greenhouse security code email."""
+    def get_greenhouse_code(self, max_wait_seconds: int = 180, since_time: datetime = None, target_company: str = None) -> Optional[str]:
+        """
+        Poll Outlook for the latest Greenhouse security code email.
+        
+        Args:
+            max_wait_seconds: Maximum time to wait in seconds
+            since_time: Only consider emails received AFTER this time
+            target_company: Only accept emails for this specific company
+        """
         if not self.ms_token:
             print(f"   ❌ No Outlook token — cannot read Greenhouse code")
             return None
 
-        print(f"   📧 Polling Outlook for Greenhouse security code (max {max_wait_seconds}s)...")
+        if since_time is None:
+            since_time = datetime.now(timezone.utc)
+        
+        start_time_str = since_time.isoformat()
+        print(f"   📧 Looking for codes received AFTER: {start_time_str}")
+        if target_company:
+            print(f"   📧 Looking for codes for company: {target_company}")
+        print(f"   📧 Polling Outlook for Greenhouse security code (max {max_wait_seconds}s, checking every 15s)...")
 
         headers = {'Authorization': f'Bearer {self.ms_token}'}
         deadline = time.time() + max_wait_seconds
-        poll_interval = 10
+        poll_interval = 15
+        
+        seen_subjects = set()
 
         while time.time() < deadline:
             try:
-                from_str = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                from_str = (datetime.now(timezone.utc) - timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ')
 
                 url = "https://graph.microsoft.com/v1.0/me/messages"
                 params = {
                     '$filter': f"receivedDateTime ge {from_str}",
-                    '$select': 'id,subject,body,receivedDateTime,from',
+                    '$select': 'id,subject,body,receivedDateTime,from,isRead',
                     '$orderby': 'receivedDateTime DESC',
-                    '$top': 20,
+                    '$top': 30,
                 }
 
                 response = requests.get(url, headers=headers, params=params, timeout=10)
@@ -232,40 +248,56 @@ class AIApplier:
                     continue
 
                 messages = response.json().get('value', [])
-
-                greenhouse_emails = [
-                    m for m in messages
-                    if 'greenhouse-mail.io' in m.get('from', {})
-                                               .get('emailAddress', {})
-                                               .get('address', '').lower()
-                ]
-
+                
+                # Filter to emails from Greenhouse
+                greenhouse_emails = []
+                for m in messages:
+                    sender = m.get('from', {}).get('emailAddress', {}).get('address', '').lower()
+                    if any(pattern in sender for pattern in [
+                        'greenhouse-mail.io',
+                        'greenhouse.io',
+                        'notifications@greenhouse',
+                        'mailer@greenhouse'
+                    ]):
+                        greenhouse_emails.append(m)
+                
                 if greenhouse_emails:
-                    msg = greenhouse_emails[0]
-                    body = msg.get('body', {}).get('content', '')
-
-                    # Extract 8-char alphanumeric code
-                    code = None
-                    bold_match = re.search(
-                        r'<(?:b|strong)[^>]*>([A-Za-z0-9]{8})</(?:b|strong)>',
-                        body, re.IGNORECASE
-                    )
-                    if bold_match:
-                        code = bold_match.group(1)
-
-                    if not code:
-                        contextual = re.search(
-                            r'(?:paste this code[^:]*:|your code[^:]*:|code\s*:)\s*([A-Za-z0-9]{8})\b',
-                            body, re.IGNORECASE
-                        )
-                        if contextual:
-                            code = contextual.group(1)
-
-                    if code:
-                        return code
-
+                    greenhouse_emails.sort(key=lambda x: x.get('receivedDateTime', ''), reverse=True)
+                    
+                    for msg in greenhouse_emails:
+                        subject = msg.get('subject', '')
+                        received_time = msg.get('receivedDateTime', '')
+                        
+                        # Check if email is for the target company
+                        if target_company:
+                            # Look for company name in subject
+                            if target_company.lower() not in subject.lower():
+                                print(f"   ⏳ Email for different company (looking for {target_company}): {subject[:50]}")
+                                continue
+                        
+                        # Only accept emails received AFTER submit time
+                        if received_time >= start_time_str:
+                            
+                            if any(keyword in subject.lower() for keyword in ['security', 'code', 'verification', 'pin']):
+                                
+                                msg_id = msg.get('id', '')
+                                if msg_id in seen_subjects:
+                                    continue
+                                seen_subjects.add(msg_id)
+                                
+                                body = msg.get('body', {}).get('content', '')
+                                print(f"   📨 Greenhouse email found — Subject: {subject[:80]}")
+                                print(f"   📨 Received at: {received_time}")
+                                
+                                code = self._extract_code_from_email(body)
+                                if code:
+                                    print(f"   ✅ Code extracted: {code}")
+                                    return code
+                        else:
+                            print(f"   ⏳ Email received at {received_time} is before submit ({start_time_str}), waiting for newer...")
+                
                 remaining = int(deadline - time.time())
-                print(f"   ⏳ No code yet — waiting {poll_interval}s (timeout in {remaining}s)...")
+                print(f"   ⏳ No matching security code yet — waiting {poll_interval}s (timeout in {remaining}s)...")
                 time.sleep(poll_interval)
 
             except Exception as e:
@@ -273,6 +305,36 @@ class AIApplier:
                 time.sleep(poll_interval)
 
         print(f"   ❌ Timed out waiting for Greenhouse security code")
+        return None
+
+    def _extract_code_from_email(self, body: str) -> Optional[str]:
+        """Extract 8-character code from email body"""
+        # Strategy 1: Bold HTML tag
+        bold_match = re.search(
+            r'<(?:b|strong)[^>]*>([A-Za-z0-9]{8})</(?:b|strong)>',
+            body, re.IGNORECASE
+        )
+        if bold_match:
+            return bold_match.group(1)
+        
+        # Strategy 2: Contextual pattern
+        contextual = re.search(
+            r'(?:paste this code[^:]*:|your code[^:]*:|code\s*:)\s*([A-Za-z0-9]{8})\b',
+            body, re.IGNORECASE
+        )
+        if contextual:
+            return contextual.group(1)
+        
+        # Strategy 3: Any 8-char alphanumeric
+        clean_body = re.sub(r'<[^>]+>', ' ', body)
+        exclude = {'security', 'password', 'clicking', 'whatever', 'everyone', 'continue', 'applying', 'received', 'resubmit', 'entering', 'verified', 'complete', 'applicat', 'position', 'attached'}
+        for m in re.finditer(r'\b([A-Za-z0-9]{8})\b', clean_body):
+            candidate = m.group(1)
+            has_digit = bool(re.search(r'\d', candidate))
+            has_letter = bool(re.search(r'[A-Za-z]', candidate))
+            if has_digit and has_letter and candidate.lower() not in exclude:
+                return candidate
+        
         return None
 
     def _load_yaml(self, path: Path) -> dict:
@@ -364,7 +426,7 @@ class AIApplier:
     async def apply(self, browser, job_url: str, resume_path: Path, cover_path: Path, job_title: str, company: str) -> Dict:
         """Submit application using browser-use"""
 
-        # Duplicate check
+        # Duplicate check using the persistent db connection
         import re
         match = re.search(r'/jobs/view/(\d+)', job_url)
         if match:
@@ -423,18 +485,36 @@ DICE LOGIN CREDENTIALS (use these if you hit a login wall):
 - Steps: go to https://www.dice.com/login → enter email → click Continue → enter password → click Sign in → wait 5 seconds → navigate back to the job URL
 """
 
-        # Greenhouse code instruction
-        greenhouse_code_instruction = ""
-        if is_greenhouse:
-            greenhouse_code_instruction = """
+        # Greenhouse code instruction with timestamp capture
+        greenhouse_code_instruction = """
 
-SECURITY CODE STEP (Greenhouse only):
-- After clicking Submit, a security code screen may appear
-- DO NOT close the page or navigate away
-- Return the text "AWAITING_CODE" and STOP — the system will fetch the code from Outlook automatically
-- Once you receive the code back, enter it in the verification field and complete submission
+CRITICAL TIMING INSTRUCTION:
+
+STEP 1 - CAPTURE START TIME (DO THIS FIRST, BEFORE ANYTHING ELSE):
+   Run this JavaScript immediately when you load the application page:
+      new Date().toISOString().slice(0, 19).replace('T', ' ')
+   
+   This is your REFERENCE TIME. Save it. You will use it later.
+
+STEP 2 - FILL THE FORM:
+   Fill all required fields normally.
+
+STEP 3 - HANDLE THE CODE SCREEN (if it appears):
+   If a security code screen appears at any point (even before you click Submit):
+      - This means the form was submitted automatically (e.g., by pressing Enter)
+      - DO NOT click anything else
+      - Return: "AWAITING_CODE|" + [YOUR REFERENCE TIME FROM STEP 1] + "|" + [COMPANY NAME]
+   
+   The system will find the code email that arrived AFTER your reference time.
+
+STEP 4 - IF NO CODE SCREEN APPEARS:
+   Click the "Submit application" button normally
+   When the code screen appears, return: "AWAITING_CODE|" + [REFERENCE TIME] + "|" + [COMPANY NAME]
+
+The company name is: {company}
+
+IMPORTANT: The reference time is captured at the VERY BEGINNING, before any form filling or submission attempts.
 """
-
         task = f"""Your job is to apply to this specific job posting: {job_url}
 
 FIRST ACTION — navigate to the URL above.
@@ -465,10 +545,33 @@ Return "SUCCESS" when submitted, "BLOCKED" if rate limited, "SKIPPED - <reason>"
 
             # Greenhouse security code flow
             if is_greenhouse and "AWAITING_CODE" in final.upper():
-                print(f"   📧 Greenhouse needs security code — fetching from Outlook...")
-                code = self.get_greenhouse_code(max_wait_seconds=180)
+                import re
+                from datetime import datetime, timezone
+                
+                # Try to extract timestamp from agent response
+                timestamp_match = re.search(r'AWAITING_CODE\|(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', final)
+                
+                if timestamp_match:
+                    time_str = timestamp_match.group(1)
+                    try:
+                        # Parse the timestamp (assume UTC since agent was instructed to use UTC)
+                        submit_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                        submit_time = submit_time.replace(tzinfo=timezone.utc)
+                        print(f"   📧 Agent reported submit at: {submit_time.isoformat()}")
+                    except ValueError as e:
+                        print(f"   ⚠️ Could not parse timestamp '{time_str}': {e}")
+                        submit_time = datetime.now(timezone.utc)
+                        print(f"   📧 Falling back to current time: {submit_time.isoformat()}")
+                else:
+                    # No timestamp found, use current time as fallback
+                    submit_time = datetime.now(timezone.utc)
+                    print(f"   📧 No timestamp from agent, using current: {submit_time.isoformat()}")
+                
+                print(f"   📧 Looking for codes received AFTER this time...")
+                code = self.get_greenhouse_code(max_wait_seconds=180, since_time=submit_time)
 
                 if code:
+                    # Build character list for the split-input field
                     code_task = f"""
 The current page shows a security code verification form.
 The code to enter is: {code}

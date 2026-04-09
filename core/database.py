@@ -125,32 +125,32 @@ class JobDatabase:
     
     def is_duplicate(self, url: str, cooldown_days: int = 5) -> Tuple[bool, bool, int, Optional[str]]:
         """
-        Returns: (is_duplicate, can_reapply, days_since_last, existing_folder_path)
+        Returns: (is_duplicate, can_reapply, days_since_last_application, existing_folder_path)
         
         Rules:
-        - In pending/processing queue → duplicate, cannot reapply
-        - Successfully applied within cooldown → duplicate, cannot reapply
-        - Successfully applied outside cooldown → NOT duplicate, CAN reapply
-        - Any other status (skipped, queued without applied) → NOT duplicate, treat as new
+        - In pending/processing queue → duplicate, CANNOT reapply
+        - Successfully applied (status='applied') within cooldown → duplicate, CANNOT reapply
+        - Successfully applied (status='applied') outside cooldown → NOT duplicate, CAN reapply (repost)
+        - Any other status (queued, skipped, failed, etc.) → NOT duplicate, treat as NEW
         """
         linkedin_id = self._extract_linkedin_job_id(url) if 'linkedin.com' in url else None
 
-        # STEP 1: In pending/processing queue? → STOP
+        # STEP 1: Check if already in queue and pending/processing
         if linkedin_id:
             self.cursor.execute('''
-                SELECT id FROM application_queue 
+                SELECT id, status FROM application_queue 
                 WHERE linkedin_job_id = ? AND status IN ('pending', 'processing')
             ''', (linkedin_id,))
         else:
             self.cursor.execute('''
-                SELECT id FROM application_queue 
+                SELECT id, status FROM application_queue 
                 WHERE job_url = ? AND status IN ('pending', 'processing')
             ''', (url,))
         
         if self.cursor.fetchone():
-            return (True, False, 0, None)
+            return (True, False, 0, None)  # In active queue - block
 
-        # STEP 2: Successfully applied before? Check cooldown
+        # STEP 2: Check for SUCCESSFUL applications only (status='applied')
         if linkedin_id:
             self.cursor.execute('''
                 SELECT last_applied_date, folder_path 
@@ -173,12 +173,18 @@ class JobDatabase:
             days_since = (datetime.now() - last_applied).days
             
             if days_since < cooldown_days:
+                # Recently applied - block
                 return (True, False, days_since, row['folder_path'])
             else:
+                # Old application - allow repost
                 return (False, True, days_since, row['folder_path'])
 
-        # STEP 3: Any other status (skipped, queued without applied, etc.)
-        # Treat as NEW - let it be processed again
+        # STEP 3: No successful application found - treat as NEW
+        # This includes jobs that were:
+        # - Queued but never applied (status='queued')
+        # - Failed applications (status='failed')
+        # - Skipped (status='skipped')
+        # - Never seen before
         return (False, False, 0, None)
     
     def find_existing_job_folder(self, url: str) -> Optional[Dict]:
@@ -328,123 +334,146 @@ class JobDatabase:
         """
         Add a job to the application queue.
         
-        Handles three cases:
-          1. Already in pending/processing → skip (silent, is_duplicate caught this)
-          2. Repost (applied before, cooldown passed) → resurface existing queue record
-             OR insert new record with reapplied_count incremented
-          3. Brand new job → fresh INSERT
+        Logic:
+        1. If job is already in queue with status 'pending' or 'processing' → SKIP
+        2. If job was successfully applied to within cooldown period → SKIP
+        3. If job was applied to but cooldown passed → RESURFACE (update existing to pending)
+        4. If job was never applied to (queued/skipped/failed/new) → INSERT NEW
         
-        Returns True if the job was successfully added/resurfaced, False otherwise.
+        Returns True if added/resurfaced, False otherwise
         """
         url = job_info['url']
         linkedin_id = self._extract_linkedin_job_id(url) if 'linkedin.com' in url else None
         
-        # Check duplicate status
+        # STEP 1: Check if already in active queue
+        if linkedin_id:
+            self.cursor.execute('''
+                SELECT id, status FROM application_queue 
+                WHERE linkedin_job_id = ? AND status IN ('pending', 'processing')
+            ''', (linkedin_id,))
+        else:
+            self.cursor.execute('''
+                SELECT id, status FROM application_queue 
+                WHERE job_url = ? AND status IN ('pending', 'processing')
+            ''', (url,))
+        
+        active_record = self.cursor.fetchone()
+        if active_record:
+            print(f"      ⏸️ Already in queue ({active_record['status']}) - skipping")
+            return False
+        
+        # STEP 2: Check duplicate status (applied within cooldown vs repost allowed)
         is_dup, can_reapply, days_since, existing_folder = self.is_duplicate(url)
         
         if is_dup and not can_reapply:
-            # is_duplicate already prints a reason in most callers; be quiet here
+            # Applied recently - block
+            print(f"      ⏭️ Applied {days_since} days ago (cooldown active) - skipping")
             return False
         
-        # ── REPOST PATH ─────────────────────────────────────────────────────
-        # Job was applied before, cooldown has passed → resurface it.
+        # STEP 3: Handle repost (applied before, cooldown passed)
         if can_reapply and existing_folder:
-            print(f"      🔁 REPOST: Last applied {days_since} days ago — resurfacing")
+            print(f"      🔁 REPOST: Last applied {days_since} days ago - resurfacing")
             
             folder_path = Path(existing_folder)
             resume_path = job_info.get('resume_path') or str(folder_path / "tailored_resume.pdf")
             cover_path  = job_info.get('cover_path')  or str(folder_path / "cover_letter.pdf")
             
             try:
-                # Try to resurface an existing queue record (any status except pending/processing)
-                # Match by linkedin_job_id for LinkedIn (handles URL changes on reposts)
-                # or by job_url for other platforms.
+                # Check if there's an existing queue record (any status except pending/processing)
                 if linkedin_id:
                     self.cursor.execute('''
-                        UPDATE application_queue 
-                        SET status        = 'pending',
-                            job_url       = ?,
-                            resume_path   = ?,
-                            cover_path    = ?,
-                            created_at    = ?,
-                            reapplied_count = COALESCE(reapplied_count, 0) + 1,
-                            error         = NULL
+                        SELECT id, status, reapplied_count 
+                        FROM application_queue 
                         WHERE linkedin_job_id = ?
-                          AND status NOT IN ('pending', 'processing')
-                    ''', (url, str(resume_path), str(cover_path),
-                          datetime.now().isoformat(), linkedin_id))
+                    ''', (linkedin_id,))
                 else:
+                    self.cursor.execute('''
+                        SELECT id, status, reapplied_count 
+                        FROM application_queue 
+                        WHERE job_url = ?
+                    ''', (url,))
+                
+                existing_record = self.cursor.fetchone()
+                
+                if existing_record:
+                    # Update existing record back to pending
                     self.cursor.execute('''
                         UPDATE application_queue 
-                        SET status        = 'pending',
-                            resume_path   = ?,
-                            cover_path    = ?,
-                            created_at    = ?,
+                        SET status = 'pending',
+                            job_url = ?,
+                            resume_path = ?,
+                            cover_path = ?,
+                            hiring_manager = ?,
+                            created_at = ?,
                             reapplied_count = COALESCE(reapplied_count, 0) + 1,
-                            error         = NULL
-                        WHERE job_url = ?
-                          AND status NOT IN ('pending', 'processing')
-                    ''', (str(resume_path), str(cover_path),
-                          datetime.now().isoformat(), url))
-                
-                if self.cursor.rowcount > 0:
-                    # Successfully resurfaced existing record
-                    self.conn.commit()
-                    print(f"      ✅ Repost resurfaced in queue (reapplied_count incremented)")
-                    return True
-                
-                # No existing queue record at all → fresh INSERT (first repost ever queued)
-                if linkedin_id:
-                    self.cursor.execute('''
-                        INSERT INTO application_queue 
-                        (job_url, linkedin_job_id, job_title, company, match_score, 
-                         resume_path, cover_path, hiring_manager, created_at, status, reapplied_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1)
+                            error = NULL,
+                            processed_at = NULL
+                        WHERE id = ?
                     ''', (
-                        url, linkedin_id,
-                        job_info.get('title', 'Unknown'), job_info.get('company', 'Unknown'),
-                        job_info.get('score', 70),
-                        str(resume_path), str(cover_path),
+                        url, str(resume_path), str(cover_path),
                         job_info.get('hiring_manager'),
                         datetime.now().isoformat(),
+                        existing_record['id']
                     ))
+                    print(f"      ✅ Repost resurfaced (reapplied_count: {existing_record['reapplied_count'] + 1})")
                 else:
-                    self.cursor.execute('''
-                        INSERT INTO application_queue 
-                        (job_url, job_title, company, match_score, resume_path, cover_path, 
-                         hiring_manager, created_at, status, reapplied_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1)
-                    ''', (
-                        url,
-                        job_info.get('title', 'Unknown'), job_info.get('company', 'Unknown'),
-                        job_info.get('score', 70),
-                        str(resume_path), str(cover_path),
-                        job_info.get('hiring_manager'),
-                        datetime.now().isoformat(),
-                    ))
+                    # No queue record exists - create fresh one for repost
+                    if linkedin_id:
+                        self.cursor.execute('''
+                            INSERT INTO application_queue 
+                            (job_url, linkedin_job_id, job_title, company, match_score, 
+                             resume_path, cover_path, hiring_manager, created_at, status, reapplied_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1)
+                        ''', (
+                            url, linkedin_id,
+                            job_info.get('title', 'Unknown'), 
+                            job_info.get('company', 'Unknown'),
+                            job_info.get('score', 70),
+                            str(resume_path), str(cover_path),
+                            job_info.get('hiring_manager'),
+                            datetime.now().isoformat(),
+                        ))
+                    else:
+                        self.cursor.execute('''
+                            INSERT INTO application_queue 
+                            (job_url, job_title, company, match_score, resume_path, cover_path, 
+                             hiring_manager, created_at, status, reapplied_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1)
+                        ''', (
+                            url,
+                            job_info.get('title', 'Unknown'), 
+                            job_info.get('company', 'Unknown'),
+                            job_info.get('score', 70),
+                            str(resume_path), str(cover_path),
+                            job_info.get('hiring_manager'),
+                            datetime.now().isoformat(),
+                        ))
+                    print(f"      ✅ Repost inserted as new queue record (reapplied_count: 1)")
                 
                 self.conn.commit()
-                print(f"      ✅ Repost inserted as new queue record")
                 return True
                 
             except sqlite3.IntegrityError as e:
-                # UNIQUE constraint: a record with this exact URL already exists as pending.
-                # This means is_duplicate missed it somehow — log and skip gracefully.
-                print(f"      ⚠️ Repost queue conflict (already pending?): {e}")
+                print(f"      ⚠️ Repost queue conflict: {e}")
                 return False
         
-        # ── NEW JOB PATH ─────────────────────────────────────────────────────
+        # STEP 4: New job (never applied, or only queued/skipped/failed before)
+        print(f"      🆕 New job - adding to queue")
+        
         try:
             if linkedin_id:
                 self.cursor.execute('''
                     INSERT INTO application_queue 
                     (job_url, linkedin_job_id, job_title, company, match_score, 
-                     resume_path, cover_path, hiring_manager, created_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                     resume_path, cover_path, hiring_manager, created_at, status, reapplied_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)
                 ''', (
                     url, linkedin_id,
-                    job_info['title'], job_info['company'], job_info['score'],
-                    job_info['resume_path'], job_info['cover_path'],
+                    job_info.get('title', 'Unknown'), 
+                    job_info.get('company', 'Unknown'),
+                    job_info.get('score', 70),
+                    job_info.get('resume_path', ''), 
+                    job_info.get('cover_path', ''),
                     job_info.get('hiring_manager'),
                     datetime.now().isoformat(),
                 ))
@@ -452,20 +481,25 @@ class JobDatabase:
                 self.cursor.execute('''
                     INSERT INTO application_queue 
                     (job_url, job_title, company, match_score, resume_path, cover_path, 
-                     hiring_manager, created_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                     hiring_manager, created_at, status, reapplied_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)
                 ''', (
                     url,
-                    job_info['title'], job_info['company'], job_info['score'],
-                    job_info['resume_path'], job_info['cover_path'],
+                    job_info.get('title', 'Unknown'), 
+                    job_info.get('company', 'Unknown'),
+                    job_info.get('score', 70),
+                    job_info.get('resume_path', ''), 
+                    job_info.get('cover_path', ''),
                     job_info.get('hiring_manager'),
                     datetime.now().isoformat(),
                 ))
             
             self.conn.commit()
+            print(f"      ✅ Added to queue (pending count: {self.get_pending_queue_count()})")
             return True
             
         except sqlite3.IntegrityError as e:
+            # This should rarely happen now with the active queue check above
             print(f"      ⚠️ Database error: {e}")
             return False
     

@@ -10,12 +10,11 @@ import sys
 sys.path.append(str(Path(__file__).parent))
 
 from core.database import JobDatabase
+from bots.queue_processor import QueueProcessor
 from bots.linkedin import LinkedInBot
 from bots.dice import DiceBot
 from bots.greenhouse import GreenhouseBot
-from bots.wellfound import WellfoundBot  # NEW
-from bots.queue_processor import QueueProcessor
-
+#from bots.wellfound import WellfoundBot  # NEW
 
 async def run_bot_safe(bot):
     """
@@ -75,7 +74,7 @@ async def main():
         LinkedInBot(profile, db, None),
         DiceBot(profile, db, None),
         GreenhouseBot(profile, db, None),
-        WellfoundBot(profile, db, None),  # NEW - Wellfound bot added
+        #WellfoundBot(profile, db, None),  # NEW - Wellfound bot added
     ]
 
     # Create queue processor and give it the SAME db
