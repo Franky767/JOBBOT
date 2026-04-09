@@ -1,5 +1,8 @@
 # Job Bot Setup
 
+## Keep in mind
+- Within my program, I have a lot of sensitive folders that I didnt include. Double check paths to the specific necessary files and imports in the code and either simplify them, or re-create the path.
+
 ## Prerequisites
 - Python 3.12+
 - Chrome browser
@@ -23,4 +26,7 @@
 ## Running
 
 ```bash
+#for one individual bot
 python3 run_single_bot.py
+#for all bots running concurrently
+python3 run_bots.py
