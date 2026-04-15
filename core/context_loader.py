@@ -62,24 +62,16 @@ class ContextLoader:
         platform: str,
         resume_path: str,
         cover_path: str,
+        include_login: bool = True,  # NEW PARAMETER
     ) -> str:
         """
         Returns the complete, minimal instruction string for a browser-use apply call.
- 
-        Includes:
-          - Selected _shared modules for this platform
-          - Platform steps.md (with resume/cover paths injected)
-          - Platform form_quirks.md
- 
-        Does NOT include login instructions (handled separately).
- 
+        
         Args:
-            platform:    'linkedin', 'dice', 'greenhouse', 'wellfound', or 'remote100k'
-            resume_path: Absolute path string to the tailored resume PDF
-            cover_path:  Absolute path string to the cover letter PDF
- 
-        Returns:
-            A single assembled string ready to pass as browser-use instructions.
+            platform: Platform name (linkedin, dice, greenhouse, etc.)
+            resume_path: Path to tailored resume PDF
+            cover_path: Path to cover letter PDF
+            include_login: If True, include login instructions (should be True only for first job)
         """
         platform = platform.lower()
         chunks = []
@@ -90,23 +82,29 @@ class ContextLoader:
             if content:
                 chunks.append(content)
  
-        # 2. Platform-specific steps with paths injected
+        # 2. Login instructions - ONLY if include_login is True AND platform needs login
+        if include_login and platform in ['linkedin', 'dice']:
+            login_content = self._read(platform, 'login.md')
+            if login_content:
+                creds = self._get_credentials(platform)
+                login_content = login_content.replace('{email}', creds.get('email', ''))
+                login_content = login_content.replace('{password}', creds.get('password', ''))
+                chunks.append(login_content)
+ 
+        # 3. Platform-specific steps with paths injected
         steps = self._read(platform, 'steps.md')
         if steps:
             steps = steps.replace('{resume_path}', str(resume_path))
             steps = steps.replace('{cover_path}', str(cover_path))
             chunks.append(steps)
  
-        # 3. Platform-specific form quirks
+        # 4. Platform-specific form quirks
         quirks = self._read(platform, 'form_quirks.md')
         if quirks:
             chunks.append(quirks)
  
         if not chunks:
-            raise ValueError(
-                f"No context files found for platform '{platform}'. "
-                f"Check that JOBBOT/platforms/{platform}/ exists and is populated."
-            )
+            raise ValueError(f"No context files found for platform '{platform}'.")
  
         # Join all chunks
         content = '\n\n---\n\n'.join(chunks)
@@ -115,7 +113,7 @@ class ContextLoader:
         content = self._replace_placeholders(content)
  
         return content
- 
+    
     def load_login_context(self, platform: str) -> str:
         """
         Returns ONLY the login instructions for this platform.

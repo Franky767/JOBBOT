@@ -268,15 +268,30 @@ class AIApplier:
                         subject = msg.get('subject', '')
                         received_time = msg.get('receivedDateTime', '')
                         
-                        # Check if email is for the target company
-                        if target_company:
-                            # Look for company name in subject
-                            if target_company.lower() not in subject.lower():
-                                print(f"   ⏳ Email for different company (looking for {target_company}): {subject[:50]}")
-                                continue
+                        # Check company match
+                        if target_company and target_company.lower() not in subject.lower():
+                            print(f"   ⏳ Email for different company (looking for {target_company}): {subject[:50]}")
+                            continue
                         
-                        # Only accept emails received AFTER submit time
-                        if received_time >= start_time_str:
+                        # Get the body FIRST
+                        body = msg.get('body', {}).get('content', '')  # ← ADD THIS LINE
+                        
+                        print(f"   📨 Greenhouse email found — Subject: {subject[:80]}")
+                        print(f"   📨 Received at: {received_time}")
+                        
+                        code = self._extract_code_from_email(body)  # ← Now body exists
+                        if code:
+                            print(f"   ✅ Code extracted: {code}")
+                            return code
+                        
+                        # If we get here, it's the right company
+                        code = self._extract_code_from_email(body)
+                        if code:
+                            return code  # ← This should return immediately
+                        
+                        # Normalize both to ISO format without timezone differences
+                        received_normalized = received_time.replace('Z', '+00:00')
+                        if received_normalized >= start_time_str:
                             
                             if any(keyword in subject.lower() for keyword in ['security', 'code', 'verification', 'pin']):
                                 
@@ -423,30 +438,18 @@ class AIApplier:
 
         return False
 
-    async def apply(self, browser, job_url: str, resume_path: Path, cover_path: Path, job_title: str, company: str) -> Dict:
+    async def apply(self, browser, job_url: str, resume_path: Path, cover_path: Path, 
+                    job_title: str, company: str, include_login: bool = True) -> Dict:
         """Submit application using browser-use"""
 
-        # Duplicate check using the persistent db connection
+        # Clean URL (remove tracking parameters)
+        clean_url = job_url.split('?')[0]
+        
+        # Extract job ID for logging
         import re
         match = re.search(r'/jobs/view/(\d+)', job_url)
-        if match:
-            job_id = match.group(1)
-            is_dup, can_reapply, days_since, existing_folder = self.db.is_duplicate(job_url)
-            
-            if is_dup and not can_reapply:
-                print(f"      🔁 JOB ID {job_id} already processed - SKIPPING (applied {days_since} days ago)")
-                return {
-                    'success': True,
-                    'already_applied': True,
-                    'error': f'Job ID {job_id} already in database',
-                    'skipped': True
-                }
-            elif not is_dup and can_reapply and existing_folder:
-                print(f"      🔁 REPOST DETECTED: Job ID {job_id} - last applied {days_since} days ago")
-                print(f"      📁 Using existing docs from: {existing_folder}")
-                existing_folder_path = Path(existing_folder)
-                resume_path = existing_folder_path / "tailored_resume.pdf"
-                cover_path = existing_folder_path / "cover_letter.pdf"
+        job_id = match.group(1) if match else "unknown"
+        print(f"      🚀 APPLYING: Job ID {job_id} - {job_title} at {company}")
         
         # Detect platform
         platform = self._get_platform_name(job_url)
@@ -462,66 +465,25 @@ class AIApplier:
                 'success': False,
                 'platform_blocked': True,
                 'platform': platform,
-                'error': f"{platform} daily limit reached - no more applications today"
+                'error': f"{platform} daily limit reached"
             }
-        
+    
         # Build platform-scoped task
         platform_context = self.context_loader.load_apply_context(
             platform=platform,
             resume_path=str(resume_path),
             cover_path=str(cover_path),
+            include_login=include_login  # PASS TO CONTEXT LOADER
         )
 
-        # Dice login block
-        dice_login_block = ""
-        if platform == "dice":
-            dice_email = self.dice_email or self.secrets.get('dice', {}).get('email', '')
-            dice_password = self.dice_password or self.secrets.get('dice', {}).get('password', '')
-            dice_login_block = f"""
+        # Simple task - all platform-specific instructions are in platform_context
+        task = f"""CRITICAL FIRST RULE: Click answer WORDS, not question boxes. "Yes" and "No" are answer words. Long sentences are questions. Click the short word.
+Apply to this job: {clean_url}
 
-DICE LOGIN CREDENTIALS (use these if you hit a login wall):
-- Email: {dice_email}
-- Password: {dice_password}
-- Steps: go to https://www.dice.com/login → enter email → click Continue → enter password → click Sign in → wait 5 seconds → navigate back to the job URL
-"""
+Job Title: {job_title}
+Company: {company}
 
-        # Greenhouse code instruction with timestamp capture
-        greenhouse_code_instruction = """
-
-CRITICAL TIMING INSTRUCTION:
-
-STEP 1 - CAPTURE START TIME (DO THIS FIRST, BEFORE ANYTHING ELSE):
-   Run this JavaScript immediately when you load the application page:
-      new Date().toISOString().slice(0, 19).replace('T', ' ')
-   
-   This is your REFERENCE TIME. Save it. You will use it later.
-
-STEP 2 - FILL THE FORM:
-   Fill all required fields normally.
-
-STEP 3 - HANDLE THE CODE SCREEN (if it appears):
-   If a security code screen appears at any point (even before you click Submit):
-      - This means the form was submitted automatically (e.g., by pressing Enter)
-      - DO NOT click anything else
-      - Return: "AWAITING_CODE|" + [YOUR REFERENCE TIME FROM STEP 1] + "|" + [COMPANY NAME]
-   
-   The system will find the code email that arrived AFTER your reference time.
-
-STEP 4 - IF NO CODE SCREEN APPEARS:
-   Click the "Submit application" button normally
-   When the code screen appears, return: "AWAITING_CODE|" + [REFERENCE TIME] + "|" + [COMPANY NAME]
-
-The company name is: {company}
-
-IMPORTANT: The reference time is captured at the VERY BEGINNING, before any form filling or submission attempts.
-"""
-        task = f"""Your job is to apply to this specific job posting: {job_url}
-
-FIRST ACTION — navigate to the URL above.
-
-JOB: {job_title} at {company}
-
-{platform_context}{dice_login_block}{greenhouse_code_instruction}
+{platform_context}
 
 Return "SUCCESS" when submitted, "BLOCKED" if rate limited, "SKIPPED - <reason>" if skipped.
 """
@@ -549,45 +511,33 @@ Return "SUCCESS" when submitted, "BLOCKED" if rate limited, "SKIPPED - <reason>"
                 from datetime import datetime, timezone
                 
                 # Try to extract timestamp from agent response
-                timestamp_match = re.search(r'AWAITING_CODE\|(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', final)
+                match = re.search(r'AWAITING_CODE\|(.*?)\|', final)
                 
-                if timestamp_match:
-                    time_str = timestamp_match.group(1)
-                    try:
-                        # Parse the timestamp (assume UTC since agent was instructed to use UTC)
-                        submit_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-                        submit_time = submit_time.replace(tzinfo=timezone.utc)
-                        print(f"   📧 Agent reported submit at: {submit_time.isoformat()}")
-                    except ValueError as e:
-                        print(f"   ⚠️ Could not parse timestamp '{time_str}': {e}")
-                        submit_time = datetime.now(timezone.utc)
-                        print(f"   📧 Falling back to current time: {submit_time.isoformat()}")
+                if match:
+                    time_str = match.group(1).strip()
+                    submit_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                    submit_time = submit_time.replace(tzinfo=timezone.utc)
+                    print(f"   📧 Using application start time: {submit_time.isoformat()}")
+                    code = self.get_greenhouse_code(max_wait_seconds=180, since_time=submit_time, target_company=company)
                 else:
-                    # No timestamp found, use current time as fallback
-                    submit_time = datetime.now(timezone.utc)
-                    print(f"   📧 No timestamp from agent, using current: {submit_time.isoformat()}")
-                
-                print(f"   📧 Looking for codes received AFTER this time...")
-                code = self.get_greenhouse_code(max_wait_seconds=180, since_time=submit_time)
+                    # No timestamp, just search by company name
+                    print(f"   📧 No timestamp found, searching for code by company: {company}")
+                    code = self.get_greenhouse_code(max_wait_seconds=180, since_time=None, target_company=company)
 
                 if code:
-                    # Build character list for the split-input field
                     code_task = f"""
 The current page shows a security code verification form.
 The code to enter is: {code}
 
 CRITICAL — this form has INDIVIDUAL input boxes, one per character.
-There are 8 separate input fields in a row (they may be named security-input-0 through security-input-7).
+There are 8 separate input fields in a row.
 
 Enter the code character by character:
-{chr(10).join([f'  - Character {i+1}: type "{ch}" into input field {i} (security-input-{i})' for i, ch in enumerate(code)])}
+{chr(10).join([f'  - Character {i+1}: type "{ch}"' for i, ch in enumerate(code)])}
 
 After entering all 8 characters:
-1. Do NOT clear any field that already has a character
-2. Click the Submit or Verify button
-3. If you see "Thank you" or "application received" → return SUCCESS
-
-Return "SUCCESS" when the application is fully submitted.
+1. Click the Submit or Verify button
+2. Return "SUCCESS" when the application is fully submitted.
 """
                     code_agent = Agent(
                         task=code_task,
@@ -601,8 +551,8 @@ Return "SUCCESS" when the application is fully submitted.
                     result = await code_agent.run()
                     final = str(result)
                 else:
-                    print(f"   ❌ Could not retrieve Greenhouse security code from Outlook")
-                    return {'success': False, 'error': 'Greenhouse security code not received in time'}
+                    print(f"   ❌ Could not retrieve Greenhouse security code")
+                    return {'success': False, 'error': 'Greenhouse security code not received'}
             
             # Check for block detection
             if "BLOCKED" in final.upper():
@@ -612,7 +562,7 @@ Return "SUCCESS" when the application is fully submitted.
                     'success': False,
                     'platform_blocked': True,
                     'platform': platform,
-                    'error': 'Daily limit reached (detected by agent)'
+                    'error': 'Daily limit reached'
                 }
             
             success = "SUCCESS" in final.upper()

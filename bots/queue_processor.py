@@ -3,6 +3,7 @@
 
 import asyncio
 import random
+from datetime import datetime
 from pathlib import Path
 from typing import Dict
 from core.database import JobDatabase
@@ -16,7 +17,8 @@ class QueueProcessor:
         self.batch_size = batch_size
         self.browser = None
         self.running = True
-        self.platform_blocks = {}  # Track if any platform is fully blocked
+        self.platform_blocks = {}
+        self.platforms_logged_in = set()    # Track if any platform is fully blocked
     
     async def start_browser(self):
         """Start browser-use browser - SEPARATE from bots"""
@@ -83,14 +85,22 @@ class QueueProcessor:
 
             print(f"\n   🤖 [{i+1}/{len(batch)}] {job_title} at {company} ({platform})")
 
+            # Only include login instructions for first job of each platform
+            include_login = platform not in self.platforms_logged_in
+            
             result = await self.applier.apply(
                 browser=self.browser,
                 job_url=job_url,
                 resume_path=Path(job['resume_path']),
                 cover_path=Path(job['cover_path']),
                 job_title=job_title,
-                company=company
+                company=company,
+                include_login=include_login  # PASS THE PARAMETER
             )
+
+            # After processing, mark platform as logged in (if login was included)
+            if include_login and result.get('success'):
+                self.platforms_logged_in.add(platform)
 
             if result.get('platform_blocked'):
                 print(f"\n   🛑 {platform.upper()} HIT DAILY LIMIT - STOPPING ALL {platform.upper()} APPLICATIONS")
@@ -99,9 +109,18 @@ class QueueProcessor:
                 continue
 
             elif result.get('already_applied'):
-                print(f"      ⏭️ DUPLICATE: Already in database - marking as completed")
-                self.db.mark_queue_completed(job['id'], True, "Duplicate - already in database")
+                print(f"      ⏭️ DUPLICATE: Already in database - skipping without marking as applied")
+                # Just mark as skipped in queue, NOT as applied
+                self.db.cursor.execute('''
+                    UPDATE application_queue 
+                    SET status = 'skipped', 
+                        error = 'Duplicate - already in database (not reapplied)',
+                        processed_at = ?
+                    WHERE id = ?
+                ''', (datetime.now().isoformat(), job['id']))
+                self.db.conn.commit()
                 success_count += 1
+                continue
             elif result.get('repost'):
                 print(f"      🔁 REPOST: Reapplied to job")
                 self.db.mark_queue_completed(job['id'], True, "Reapplied (repost)")

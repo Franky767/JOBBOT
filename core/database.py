@@ -124,18 +124,9 @@ class JobDatabase:
     # ==================== DUPLICATE TRACKING METHODS ====================
     
     def is_duplicate(self, url: str, cooldown_days: int = 5) -> Tuple[bool, bool, int, Optional[str]]:
-        """
-        Returns: (is_duplicate, can_reapply, days_since_last_application, existing_folder_path)
-        
-        Rules:
-        - In pending/processing queue → duplicate, CANNOT reapply
-        - Successfully applied (status='applied') within cooldown → duplicate, CANNOT reapply
-        - Successfully applied (status='applied') outside cooldown → NOT duplicate, CAN reapply (repost)
-        - Any other status (queued, skipped, failed, etc.) → NOT duplicate, treat as NEW
-        """
         linkedin_id = self._extract_linkedin_job_id(url) if 'linkedin.com' in url else None
 
-        # STEP 1: Check if already in queue and pending/processing
+        # STEP 1: Check if already in active queue
         if linkedin_id:
             self.cursor.execute('''
                 SELECT id, status FROM application_queue 
@@ -148,21 +139,27 @@ class JobDatabase:
             ''', (url,))
         
         if self.cursor.fetchone():
-            return (True, False, 0, None)  # In active queue - block
+            return (True, False, 0, None)
 
-        # STEP 2: Check for SUCCESSFUL applications only (status='applied')
+        # STEP 2: Check for SUCCESSFUL applications with valid dates
         if linkedin_id:
             self.cursor.execute('''
                 SELECT last_applied_date, folder_path 
                 FROM found_jobs 
-                WHERE linkedin_job_id = ? AND status = 'applied'
+                WHERE linkedin_job_id = ? 
+                AND status = 'applied'
+                AND last_applied_date IS NOT NULL
+                AND last_applied_date != ''
                 ORDER BY last_applied_date DESC LIMIT 1
             ''', (linkedin_id,))
         else:
             self.cursor.execute('''
                 SELECT last_applied_date, folder_path 
                 FROM found_jobs 
-                WHERE job_url = ? AND status = 'applied'
+                WHERE job_url = ? 
+                AND status = 'applied'
+                AND last_applied_date IS NOT NULL
+                AND last_applied_date != ''
                 ORDER BY last_applied_date DESC LIMIT 1
             ''', (url,))
         
@@ -180,13 +177,8 @@ class JobDatabase:
                 return (False, True, days_since, row['folder_path'])
 
         # STEP 3: No successful application found - treat as NEW
-        # This includes jobs that were:
-        # - Queued but never applied (status='queued')
-        # - Failed applications (status='failed')
-        # - Skipped (status='skipped')
-        # - Never seen before
         return (False, False, 0, None)
-    
+        
     def find_existing_job_folder(self, url: str) -> Optional[Dict]:
         """Find existing job folder for reposted job"""
         linkedin_id = self._extract_linkedin_job_id(url) if 'linkedin.com' in url else None
@@ -212,6 +204,7 @@ class JobDatabase:
     def update_application_record(self, url: str, folder_path: str, match_score: int):
         """Update or create application record when reapplying"""
         linkedin_id = self._extract_linkedin_job_id(url) if 'linkedin.com' in url else None
+        now = datetime.now().isoformat()
 
         if linkedin_id:
             self.cursor.execute('''
@@ -220,16 +213,16 @@ class JobDatabase:
                     application_count = application_count + 1,
                     status = 'applied'
                 WHERE linkedin_job_id = ? AND status = 'applied'
-            ''', (datetime.now().isoformat(), linkedin_id))
+            ''', (now, linkedin_id))
             
             if self.cursor.rowcount == 0:
                 self.cursor.execute('''
                     INSERT INTO found_jobs 
                     (job_url, linkedin_job_id, folder_path, match_score, 
-                     found_date, last_applied_date, application_count, status, platform)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (url, linkedin_id, folder_path, match_score, datetime.now().isoformat(),
-                      datetime.now().isoformat(), 1, 'applied', self._detect_platform(url)))
+                     found_date, last_applied_date, application_count, status, platform, doc_created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (url, linkedin_id, folder_path, match_score, now,
+                      now, 1, 'applied', self._detect_platform(url), now))
             self.conn.commit()
             return
         
@@ -239,16 +232,16 @@ class JobDatabase:
                 application_count = application_count + 1,
                 status = 'applied'
             WHERE job_url = ?
-        ''', (datetime.now().isoformat(), url))
+        ''', (now, url))
         
         if self.cursor.rowcount == 0:
             self.cursor.execute('''
                 INSERT INTO found_jobs 
                 (job_url, folder_path, match_score, found_date, last_applied_date, 
-                 application_count, status, platform)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (url, folder_path, match_score, datetime.now().isoformat(),
-                  datetime.now().isoformat(), 1, 'applied', self._detect_platform(url)))
+                 application_count, status, platform, doc_created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (url, folder_path, match_score, now,
+                  now, 1, 'applied', self._detect_platform(url), now))
         self.conn.commit()
 
     def mark_job_dead(self, url: str, reason: str = "job_expired"):
@@ -304,26 +297,32 @@ class JobDatabase:
         return is_dup
     
     def add_job(self, url: str, title: str, company: str, score: int, folder_path: str = "", 
-                status: str = "pending", notes: str = "") -> bool:
+                status: str = "pending", notes: str = "", doc_created_at: str = None) -> bool:
         """Add job to found_jobs"""
         platform = self._detect_platform(url)
         linkedin_id = self._extract_linkedin_job_id(url) if 'linkedin.com' in url else None
+        
+        # If doc_created_at not provided, use current time
+        if doc_created_at is None:
+            doc_created_at = datetime.now().isoformat()
         
         try:
             if linkedin_id:
                 self.cursor.execute('''
                     INSERT INTO found_jobs 
                     (job_url, linkedin_job_id, job_title, company, match_score, found_date, 
-                     folder_path, platform, status, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     folder_path, platform, status, notes, doc_created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (url, linkedin_id, title, company, score, datetime.now().isoformat(),
-                      folder_path, platform, status, notes))
+                      folder_path, platform, status, notes, doc_created_at))
             else:
                 self.cursor.execute('''
                     INSERT INTO found_jobs 
-                    (job_url, job_title, company, match_score, found_date, folder_path, platform, status, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (url, title, company, score, datetime.now().isoformat(), folder_path, platform, status, notes))
+                    (job_url, job_title, company, match_score, found_date, folder_path, 
+                     platform, status, notes, doc_created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (url, title, company, score, datetime.now().isoformat(), 
+                      folder_path, platform, status, notes, doc_created_at))
             
             self.conn.commit()
             return True

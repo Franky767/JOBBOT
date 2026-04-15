@@ -430,6 +430,110 @@ class LinkedInBot(BaseBot):
                 return True
         return False
 
+    async def extract_salary_from_linkedin(self, page) -> Optional[Dict]:
+        """
+        Extract salary information from LinkedIn job page.
+        Returns dict with 'min', 'max', 'currency', 'period' or None if no salary found.
+        """
+        try:
+            # Wait a bit for salary elements to load
+            await asyncio.sleep(1)
+            
+            # Try multiple selectors where LinkedIn displays salary
+            salary_selectors = [
+                '.job-salary-info__salary',
+                '.salary-info__salary',
+                '[data-test-job-details-salary]',
+                '.jobs-unified-top-card__salary-info',
+                '.job-details-salary-info',
+                '.jobs-salary__range',
+                '[data-anonymize="salary"]'
+            ]
+            
+            salary_text = None
+            for selector in salary_selectors:
+                try:
+                    element = await page.query_selector(selector)
+                    if element:
+                        salary_text = await element.inner_text()
+                        if salary_text and salary_text.strip():
+                            break
+                except:
+                    continue
+            
+            # If no salary found via selectors, search entire page
+            if not salary_text:
+                page_text = await page.evaluate('() => document.body.innerText')
+                # Look for salary patterns in page text
+                salary_patterns = [
+                    r'\$[\d,]+(?:\s*-\s*\$[\d,]+)?\s*(?:per\s*(?:year|hour|month)|/yr|/hour|annually)',
+                    r'(?:salary|compensation|pay)[:\s]*\$[\d,]+(?:\s*-\s*\$[\d,]+)?',
+                    r'\$[\d,]+(?:\.\d{3})?\s*-\s*\$[\d,]+(?:\.\d{3})?',
+                    r'(?:up to|from)\s*\$\s*[\d,]+',
+                ]
+                for pattern in salary_patterns:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        salary_text = match.group(0)
+                        break
+            
+            if not salary_text:
+                return None
+            
+            # Parse salary text
+            salary_text = salary_text.lower().strip()
+            
+            # Extract numbers
+            numbers = re.findall(r'[\d,]+', salary_text)
+            numbers = [int(n.replace(',', '')) for n in numbers if int(n.replace(',', '')) > 0]
+            
+            if not numbers:
+                return None
+            
+            # Determine period (hourly, yearly, monthly)
+            period = 'yearly'  # default
+            if 'hour' in salary_text or '/hr' in salary_text:
+                period = 'hourly'
+            elif 'month' in salary_text or '/mo' in salary_text:
+                period = 'monthly'
+            elif 'year' in salary_text or '/yr' in salary_text or 'annual' in salary_text:
+                period = 'yearly'
+            
+            # Determine currency
+            currency = 'USD'
+            if '€' in salary_text or 'euro' in salary_text:
+                currency = 'EUR'
+            elif '£' in salary_text or 'gbp' in salary_text:
+                currency = 'GBP'
+            
+            result = {
+                'min': numbers[0] if numbers else None,
+                'max': numbers[1] if len(numbers) > 1 else numbers[0] if numbers else None,
+                'currency': currency,
+                'period': period,
+                'raw_text': salary_text
+            }
+            
+            # Convert to yearly for comparison
+            yearly_min = result['min']
+            yearly_max = result['max']
+            
+            if period == 'hourly':
+                yearly_min = result['min'] * 2080 if result['min'] else None  # 40hrs * 52 weeks
+                yearly_max = result['max'] * 2080 if result['max'] else None
+            elif period == 'monthly':
+                yearly_min = result['min'] * 12 if result['min'] else None
+                yearly_max = result['max'] * 12 if result['max'] else None
+            
+            result['yearly_min'] = yearly_min
+            result['yearly_max'] = yearly_max
+            
+            return result
+            
+        except Exception as e:
+            print(f"      ⚠️ Salary extraction error: {e}")
+            return None
+
     def extract_salary_from_description(self, description: str) -> Optional[int]:
         if not description:
             return None
@@ -579,6 +683,25 @@ class LinkedInBot(BaseBot):
             desc   = job_info['description']
             desc_lower  = desc.lower()
             title_lower = title.lower()
+
+            print(f"   🔍 Checking salary for Job ID {job_id}...")
+
+            salary_info = await self.extract_salary_from_linkedin(self.page)
+
+            if not salary_info:
+                print(f"      ❌ NO SALARY STATED - Skipping job immediately")
+                self.db.add_job(url, title, company, 0, "", status='skipped', notes="No salary information")
+                self.stats['errors'] += 1
+                return None
+
+            if salary_info.get('yearly_min', 0) < self.min_salary:
+                print(f"      ⚠️ Salary ${salary_info['yearly_min']:,} below ${self.min_salary:,} - Skipping")
+                self.db.add_job(url, title, company, 0, "", status='skipped', notes=f"Salary too low")
+                self.stats['errors'] += 1
+                return None
+
+            # Only proceed with requirement extraction, resume tailoring, etc. if salary is good
+            print(f"      ✅ Salary meets minimum - proceeding with job analysis...")
 
             # STEP 5: Description-level internship filter
             internship_patterns = [
